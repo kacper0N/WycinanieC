@@ -2,378 +2,384 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <string.h>
-#include <unistd.h>
+#include <getopt.h>
 #include <errno.h>
+#include <unistd.h>
+#include <stdbool.h>
 
 #define MAX_BUFF_SIZE 256
 #define INITIAL_CAPACITY 2
+#define ALL_SIZE 4
 
-#define RSA_LEN 512
-#define AES_128_LEN 176
-#define AES_256_LEN 240
-#define TWOFISH_256_LEN 4272
-#define SERPENT_256_LEN 560
+#define RSA_SIZE 512
+#define AES_128_SIZE 176
+#define AES_256_SIZE 240
+#define TWOFISH_256_SIZE 4272
+#define SERPENT_256_SIZE 560
 
-static size_t buff_size = 0;
-static size_t data_count = 0;
+void print_usage(void) {
+    const char *const format = "Usage: dump_memory [options] file\n"
+                               "Options:\n"
+                               "  [-a|--aes] <file>      Use offset from <file> to zeroize AES keys.\n"
+                               "  [-r|--rsa] <file>      Use offset from <file> to zeroize RSA keys.\n"
+                               "  [-s|--serpent] <file>  Use offset from <file> to zeroize SERPENT keys.\n"
+                               "  [-t|--twofish] <file>  Use offset from <file> to zeroize TWOFISH keys.\n"
+                               "  [-o|--outfile] <file>  Place the output into <file>.\n"
+                               "  [-v|--verbose]         Display extended logs.\n"
+                               "  [-h|--help]            Display this information.\n";
+    fprintf(stdout, format);
+}
+
+// IO
+#define CHUNK_SIZE 1
 
 typedef struct {
-    int key;
-    size_t offset;
-} OffsetPair;
+    FILE *fp;
+    size_t file_size;
+} FileHandler;
 
-unsigned char* read_file(FILE* stream) {
-    fseek(stream, 0L, SEEK_END);
-    buff_size = ftell(stream);
-    rewind(stream);
+FileHandler open_file(const char *const filename, const char *const mode) {
+    FileHandler file_handler = {.fp = NULL, .file_size = 0 };
 
-    unsigned char *buffer;
-    if ((buffer = calloc(buff_size + 1, sizeof(unsigned char))) == NULL) {
-        perror("Memorry\n");
-        exit(1);
+    if (mode[0] == 'r') {
+        struct stat st;
+        int status = stat(filename, &st);
+        if (status == -1) {
+            perror("Error [open_file/stat]");
+            return file_handler;
+        }
+        file_handler.file_size = (size_t) st.st_size;
+    }
+    
+
+    file_handler.fp = fopen(filename, mode);
+    if (file_handler.fp == NULL) {
+        perror("Error [open_file/fopen]");
+        return file_handler;
     }
 
-    if (fread(buffer, 1, buff_size, stream) != buff_size) {
-        fprintf(stderr, "Reading error\n");
-        fclose(stream);
-        exit(1);
+    return file_handler;
+}
+
+unsigned char* read_file(const FileHandler *const file) {
+    if (file->fp == NULL) {
+        fprintf(stderr, "Error [read_file]: File is not open\n");
+        return NULL;
     }
-    printf("Buff size: %zu\n", buff_size);
-    fclose(stream);
+
+    unsigned char *buffer = calloc(file->file_size + 1, sizeof(unsigned char));
+    if (buffer  == NULL) {
+        perror("Error [read_file/calloc]");
+        return NULL;
+    }
+
+    size_t file_size = fread(buffer, CHUNK_SIZE, file->file_size, file->fp);
+    if (file_size != file->file_size || ferror(file->fp)) {
+        perror("Error [read_file/fread]");
+        fprintf(stderr, "Total file size: %zu\n", file->file_size);
+        fprintf(stderr, "Read file size: %zu\n", file_size);
+        return NULL;
+    }
+
+    fprintf(stderr, "Read file size: %zu\n", file_size);
+
     return buffer;
 }
 
-FILE* open_file(char* filename, char *mode) {
-    struct stat st;
-
-    FILE *file;
-
-    if (stat(filename, &st) == -1) {
-        perror("Error [stat]");
-        exit(1);
+bool save_file(const char *const filepath, unsigned char *buffer, size_t file_size) {
+    FileHandler file = open_file(filepath, "wb");
+    if (file.fp == NULL) {
+        fprintf(stderr, "Program terminated.\n");
+        return false;
+    }
+    size_t written_bytes = fwrite(buffer, CHUNK_SIZE, file_size, file.fp);
+    if (written_bytes != file_size) {
+        perror("Error [save_file/fwrite]");
+        fclose(file.fp);
+        return false;
     }
 
-    if ((file = fopen(filename, mode)) == NULL) {
-        perror("Error [fopen]");
-        exit(1);
-    }
+    printf("Successfully wrote a total of %zu bytes to '%s'.\n", written_bytes, filepath);
 
-    return file;
-}
-
-void save_file(char *filename, unsigned char *buffer, OffsetPair *data_offset, size_t offset_len) {
-    FILE *output_file = NULL;
-    size_t current_pos = 0;
-    size_t total_bytes = 0;
-    printf("data size: %zu\n", data_count);
-    output_file = fopen(filename, "wb");
-    if (output_file == NULL) {
-        perror("Error while opeining file for writing\n");
-        exit(1);
-    }
-
-    for (size_t i = 0; i < data_count; i++) {
-        OffsetPair temp_offset = data_offset[i];
-        if (offset_len == 0) {
-            if (temp_offset.key == 128)
-                offset_len = AES_128_LEN;
-            if (temp_offset.key == 256)
-                offset_len = AES_256_LEN;
-        }
-
-        printf("key: %d, offset: %zu\n", temp_offset.key, temp_offset.offset);
-
-        if (temp_offset.offset >= buff_size) {
-            printf("Warning: Offset %zu is out of bounds for data size %zu", temp_offset.offset, buff_size);
-        }
-
-        if (current_pos > temp_offset.offset) {
-            printf("Warning: Overlapping or out-of-order at offset %zu.");
-
-            size_t end_pos = temp_offset.offset + offset_len;
-            if (end_pos > current_pos) {
-                current_pos = (end_pos > buff_size) ? buff_size : end_pos;
-            }
-            continue;
-        }
-
-        size_t bytes_to_write = temp_offset.offset - current_pos;
-        printf("bytes to write: %zu, current pos: %zu\n", bytes_to_write, current_pos);
-        if (bytes_to_write > 0) {
-            printf("buff to write: %c\n", buffer[current_pos]);
-            size_t written = fwrite(&buffer[current_pos], sizeof(unsigned char), bytes_to_write, output_file);
-            if (written != bytes_to_write) {
-                fprintf(stderr, "Error writing segment before offset %zu\n", temp_offset.offset);
-                perror("fwrite error details");
-                fclose(output_file);
-                exit(1);
-            }
-            total_bytes += written;
-        }
-
-        current_pos = temp_offset.offset + offset_len;
-        if (current_pos > buff_size) {
-            current_pos = buff_size;
-        }
-        printf("Skipping %zu bytes from offset %zu. Next write starts at %zu\n",
-            offset_len, temp_offset.offset, current_pos);
-    }
-
-    if (current_pos < buff_size) {
-        size_t bytes_to_write = buff_size - current_pos;
-        printf("bytes to write: %zu, current pos: %zu\n", bytes_to_write, current_pos);
-        size_t written = fwrite(&buffer[current_pos], sizeof(unsigned char), bytes_to_write, output_file);
-        if (written != bytes_to_write) {
-            fprintf(stderr, "Error writing final segment\n");
-            perror("fwrite error details");
-            fclose(output_file);
-            exit(1);
-        }
-        total_bytes += written;
-    }
-
-    printf("Successfully wrote a total of %zu bytes to '%s'.\n", total_bytes, filename);
-
-    if (fclose(output_file) != 0) {
+    if (fclose(file.fp) != 0) {
         perror("Error closing file");
     }
+
+    return true;
 }
 
-int is_valid_algorithm(const char *algo) {
-    if (strcmp(algo, "rsa") == 0 ||
-        strcmp(algo, "aes") == 0 ||
-        strcmp(algo, "twofish") == 0 ||
-        strcmp(algo, "serpent") == 0) {
-        return 1;
-    }
-    return 0;
-}
+// utils
+#define MAX_LINE_SIZE 256
 
-void print_usage(const char *prog_name) {
-     fprintf(stderr, "Usage: %s [-a <algorithm>] [-p <parsed_filepath>] [other_filepaths...]\n", prog_name);
-     fprintf(stderr, "Valid algorithms: rsa, aes, twofish, serpent\n");
-}
+typedef enum {
+    AES,
+    RSA,
+    SERPENT,
+    TWOFISH,
+} Algorithm;
 
-OffsetPair* parse_rsa_twofish_serpent(const char *parsed_filepath) {
-    FILE *parsed_file;
-    char line_buffer[MAX_BUFF_SIZE];
-    int line_number = 0;
+typedef struct {
+    size_t offset;
+    size_t key_size;
+} OffsetPair;
 
-    if (!(parsed_file = fopen(parsed_filepath, "r"))) {
-        perror("Error opening offset file");
-        exit(1);
-    }
+typedef struct {
+    OffsetPair *data;
+    size_t size;
+    size_t capacity;
+} OffsetArray;
 
-    OffsetPair *data_offset = NULL;
-    data_count = 0;
-    size_t data_capacity = 0;
-
-
-    while (fgets(line_buffer, sizeof(line_buffer), parsed_file) != NULL) {
-        line_number++;
-        char *endptr_offset;
-        unsigned long long offset;
-
-        line_buffer[strcspn(line_buffer, "\r\n")] = 0;
-
-        errno = 0;
-        offset = strtoull(line_buffer, &endptr_offset, 16);
-
-         if (errno != 0) {
-             perror("Warning: Error parsing offset on line");
-             fprintf(stderr, "\t\tLine %d: offset_part='%s'\n", line_number, line_buffer);
-             continue;
-        }
-       if (*endptr_offset != '\0') {
-             fprintf(stderr, "Warning: Invalid characters found while parsing offset on line %d: offset_part='%s'\n", line_number, line_buffer);
-             continue;
-        }
-
-        if (data_count >= data_capacity) {
-            size_t new_capacity = (data_capacity == 0) ? INITIAL_CAPACITY : data_capacity * 2;
-            OffsetPair *temp_offset = realloc(data_offset, new_capacity * sizeof(OffsetPair));
-
-            if (temp_offset == NULL) {
-                perror("Error during reallocating memory");
-                free(data_offset);
-                fclose(parsed_file);
-                exit(1);
-            }
-
-            data_offset = temp_offset;
-            data_capacity = new_capacity;
-        }
-        data_offset[data_count].key = 0;
-        data_offset[data_count].offset = offset;
-        data_count++;
-
-        printf("  Line %d: Key Size = %ld, Offset = %llx\n", line_number, data_offset[data_count-1].key, data_offset[data_count-1].offset);
+OffsetArray* parse_offset(const char *const file_path, Algorithm algorithm) {
+    FileHandler file = open_file(file_path, "r");
+    if (file.fp == NULL) {
+        fprintf(stderr, "Program terminated.\n");
+        return NULL;
     }
 
-    if (ferror(parsed_file)) {
-        perror("Error reading from file");
-    }
+    char line_buffer[MAX_LINE_SIZE];
+    size_t line_number = 0;
 
-    fclose(parsed_file);
-    printf("Finished parsing.\n");
-    return data_offset;
-}
+    OffsetArray *offset_array = malloc(sizeof(OffsetArray));
+    offset_array->data = NULL;
+    offset_array->size = 0;
+    offset_array->capacity = 0;
 
-OffsetPair* parse_aes(const char *parsed_filepath) {
-    FILE *parsed_file;
-    char line_buffer[MAX_BUFF_SIZE];
-    int line_number = 0;
-
-    if (!(parsed_file = fopen(parsed_filepath, "r"))) {
-        perror("Error opening offset file");
-        exit(1);
-    }
-
-    OffsetPair *data_offset = NULL;
-    data_count = 0;
-    size_t data_capacity = 0;
-
-
-    while (fgets(line_buffer, sizeof(line_buffer), parsed_file) != NULL) {
+    while (fgets(line_buffer, MAX_LINE_SIZE, file.fp) != NULL) {
         line_number++;
         char *comma_pos;
-        char *offset_str;
-        char *endptr_size, *endptr_offset;
-        long key_size_long;
-        unsigned long long offset;
+        char *endptr;
 
-        line_buffer[strcspn(line_buffer, "\r\n")] = 0;
+        // null-terminate line
+        size_t eol_pos = strcspn(line_buffer, "\r\n");
+        line_buffer[eol_pos] = '\0';
 
+        // find comma
         comma_pos = strchr(line_buffer, ',');
         if (comma_pos == NULL) {
-            fprintf(stderr, "Warning: Skipping line %d: No comma found: '%s'\n", line_number, line_buffer);
+            fprintf(stderr, "Warning: Skipping line %zu: No comma found: '%s'\n", line_number, line_buffer);
             continue;
         }
 
+        // parse offset
         *comma_pos = '\0';
         errno = 0;
-        key_size_long = strtol(line_buffer, &endptr_size, 10);
+        size_t offset = strtoull(line_buffer, &endptr, 16);
 
         if (errno != 0) {
-             perror("Warning: Error parsing key size on line");
-             fprintf(stderr, "\t\tLine %d: '%s'\n", line_number, line_buffer);
-             *comma_pos = ',';
-             continue;
+            perror("Warning: Error parsing offset on line");
+            fprintf(stderr, "\t\tLine %zu: '%s'\n", line_number, line_buffer);
+            continue;
         }
-        if (*endptr_size != '\0') {
-             fprintf(stderr, "Warning: Invalid characters found while parsing key size on line %d: '%s'\n", line_number, line_buffer);
-             *comma_pos = ',';
-             continue;
-        }
-        if (key_size_long != 128 && key_size_long != 256) {
-             fprintf(stderr, "Warning: Unexpected key size %ld on line %d: '%s'\n", key_size_long, line_number, line_buffer);
-             continue;
+        if (*endptr != '\0') {
+            fprintf(stderr, "Warning: Invalid characters found while parsing offset on line %zu: '%s'\n", line_number, line_buffer);
+            continue;
         }
 
-
-        offset_str = comma_pos + 1;
+        // parse key size
         errno = 0;
-        offset = strtoull(offset_str, &endptr_offset, 16);
+        size_t key_size = strtoull(comma_pos + 1, &endptr, 10);
 
-         if (errno != 0) {
-             perror("Warning: Error parsing offset on line");
-             fprintf(stderr, "\t\tLine %d: size=%ld, offset_part='%s'\n", line_number, key_size_long, offset_str);
-             *comma_pos = ',';
-             continue;
+        if (errno != 0) {
+            perror("Warning: Error parsing key size on line");
+            fprintf(stderr, "\tLine %zu: '%s'\n", line_number, line_buffer);
+            continue;
         }
-       if (*endptr_offset != '\0') {
-             fprintf(stderr, "Warning: Invalid characters found while parsing offset on line %d: size=%ld, offset_part='%s'\n", line_number, key_size_long, offset_str);
-             *comma_pos = ',';
-             continue;
+        if (*endptr != '\0') {
+            fprintf(stderr, "Warning: Invalid characters found while parsing key size on line %zu: '%s'\n", line_number, line_buffer);
+            continue;
         }
 
-        if (data_count >= data_capacity) {
-            size_t new_capacity = (data_capacity == 0) ? INITIAL_CAPACITY : data_capacity * 2;
-            OffsetPair *temp_offset = realloc(data_offset, new_capacity * sizeof(OffsetPair));
+        // save offset and key size
+        if (offset_array->size >= offset_array->capacity) {
+            size_t new_capacity = (offset_array->capacity == 0) ? INITIAL_CAPACITY : offset_array->capacity * 2;
+            OffsetPair *temp_offset = realloc(offset_array->data, new_capacity * sizeof(OffsetPair));
 
             if (temp_offset == NULL) {
-                perror("Error during reallocating memory");
-                free(data_offset);
-                fclose(parsed_file);
-                exit(1);
+                perror("Error during reallocating memory [parse/realloc]");
+                free(offset_array->data);
+                fclose(file.fp);
+                return NULL;
             }
 
-            data_offset = temp_offset;
-            data_capacity = new_capacity;
+            offset_array->data = temp_offset;
+            offset_array->capacity = new_capacity;
         }
-        data_offset[data_count].key = (int) key_size_long;
-        data_offset[data_count].offset = offset;
-        data_count++;
 
-        printf("  Line %d: Key Size = %ld, Offset = %llx\n", line_number, data_offset[data_count-1].key, data_offset[data_count-1].offset);
-    }
-
-    if (ferror(parsed_file)) {
-        perror("Error reading from file");
-    }
-
-    fclose(parsed_file);
-    printf("Finished parsing.\n");
-    return data_offset;
-}
-
-int main(int argc, char *argv[]) {
-    int opt;
-    const char *algorithm = NULL;
-    const char *parsed_filepath = NULL;
-    char *mem_filepath = NULL;
-
-    while ((opt = getopt(argc, argv, "a:p:")) != -1) {
-        switch (opt) {
-            case 'a':
-                if (is_valid_algorithm(optarg)) {
-                    algorithm = optarg;
-                } else {
-                    fprintf(stderr, "Error: Invalid algorithm specified for -a: %s\n", optarg);
-                    print_usage(argv[0]);
-                    return EXIT_FAILURE;
+        offset_array->data[offset_array->size].offset = offset;
+        switch (algorithm) {
+            case AES:
+                if (key_size == 128)
+                    offset_array->data[offset_array->size].key_size = AES_128_SIZE;
+                else if (key_size == 256)
+                    offset_array->data[offset_array->size].key_size = AES_256_SIZE;
+                else {
+                    fprintf(stderr, "Warning: Invalid key size\n");
+                    continue;
                 }
                 break;
-            case 'p':
-                parsed_filepath = optarg;
+            case RSA:
+                offset_array->data[offset_array->size].key_size = RSA_SIZE;
                 break;
-            case '?':
+            case SERPENT:
+                offset_array->data[offset_array->size].key_size = SERPENT_256_SIZE;
+                break;
+            case TWOFISH:
+                offset_array->data[offset_array->size].key_size = TWOFISH_256_SIZE;
+                break;
             default:
-                print_usage(argv[0]);
+                // unreachable
+                break;
+        }
+        
+        offset_array->size++;
+
+        printf("\tLine %02zu: offset = 0x%08zx, key size = %zu\n", line_number, offset_array->data[offset_array->size-1].offset, offset_array->data[offset_array->size-1].key_size);
+    }
+
+    if (ferror(file.fp)) {
+        perror("Error reading from file");
+        return NULL;
+    }
+
+    fclose(file.fp);
+    printf("Finished parsing.\n");
+
+    return offset_array;
+}
+
+bool zero_buffer(unsigned char *buffer, const OffsetArray *const offsets, const size_t buff_size) {
+    for (size_t i = 0; i < offsets->size; i++) {
+        OffsetPair offset = offsets->data[i];
+
+        if (offset.offset >= buff_size) {
+            printf("Warning: Offset %zu is out of bounds for data size %zu\n", offset.offset, buff_size);
+        }
+
+        memset((void *)(buffer + offset.offset), 0, offset.key_size);
+    }
+    return true;
+}
+
+
+
+int main(int argc, char *argv[]) {
+    const char *mem_filepath = NULL;
+    const char *output_filepath = "./mem_dump_zeros.mem";
+
+    const char *aes_filepath = NULL;
+    const char *rsa_filepath = NULL;
+    const char *serpent_filepath = NULL;
+    const char *twofish_filepath = NULL;
+
+    struct option longopts[] = {
+        {"aes", required_argument, NULL, 'a'},
+        {"rsa", required_argument, NULL, 'r'},
+        {"serpent", required_argument, NULL, 's'},
+        {"twofish", required_argument, NULL, 't'},
+        {"outfile", required_argument, NULL, 'o'},
+        {"verbose", required_argument, NULL, 'v'},
+        {"help", required_argument, NULL, 'h'},
+        {0, 0, 0, 0},
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "a:r:s:t:o:vh", longopts, NULL)) != -1) {
+        switch (opt) {
+            case 'a':
+                aes_filepath = optarg;
+                printf("\t--aes %s\n", aes_filepath);
+                break;
+            case 'r':
+                rsa_filepath = optarg;
+                printf("\t--rsa %s\n", rsa_filepath);
+                break;
+            case 's':
+                serpent_filepath = optarg;
+                printf("\t--serpent %s\n", serpent_filepath);
+                break;
+            case 't':
+                twofish_filepath = optarg;
+                printf("\t--twofish %s\n", twofish_filepath);
+                break;
+            case 'o':
+                output_filepath = optarg;
+                printf("\t--outfile %s\n", output_filepath);
+                break;
+            case 'v':
+                // TODO
+                break;
+            case 'h':
+                print_usage();
+                return EXIT_FAILURE;
+            default:
+                fprintf(stderr, "Try 'dump_mem --help' for more information.\n");
                 return EXIT_FAILURE;
         }
     }
-
-    printf("Configuration:\n");
-    printf("  Algorithm (-a): %s\n", algorithm ? algorithm : "none");
-    printf("  Parsed Filepath (-p): %s\n", parsed_filepath ? parsed_filepath : "none");
-
-    FILE *stream;
-    unsigned char *buffer;
-
-    printf("  Other Filepaths:\n");
-    if (optind < argc) {
-        for (int i = optind; i < argc; ++i) {
-            mem_filepath = argv[i];
-        }
+    if (argc - optind != 1) {
+        fprintf(stderr, "Error: Incorrect number of given filepath\n");
+        return EXIT_FAILURE;
     }
 
-    printf("    - %s\n", mem_filepath);
-    stream = open_file(mem_filepath, "rb");
-    buffer = read_file(stream);
+    mem_filepath = argv[optind];
 
-    OffsetPair *data_offset = NULL;
-    if (strcmp(algorithm, "rsa") == 0) {
-        data_offset = parse_rsa_twofish_serpent(parsed_filepath);
-        save_file("./rsa_memdump.mem", buffer, data_offset, RSA_LEN);
-    } else if (strcmp(algorithm, "aes") == 0) {
-        data_offset = parse_aes(parsed_filepath);
-        save_file("./aes_memdump.mem", buffer, data_offset, 0);
-    } else if (strcmp(algorithm, "twofish") == 0) {
-        data_offset = parse_rsa_twofish_serpent(parsed_filepath);
-        save_file("./twofish_memdump.mem", buffer, data_offset, TWOFISH_256_LEN);
-    } else if (strcmp(algorithm, "serpent") == 0) {
-        data_offset = parse_rsa_twofish_serpent(parsed_filepath);
-        save_file("./serpent_memdump.mem", buffer, data_offset, SERPENT_256_LEN);
+    printf("Opening memory from %s\n", mem_filepath);
+    FileHandler mem_file = open_file(mem_filepath, "rb");
+    if (mem_file.fp == NULL) {
+        fprintf(stderr, "Program terminated.\n");
+        return EXIT_FAILURE;
     }
+    printf("Memory successfully opened.\n");
+    
+    printf("Loading memory to buffer.\n");
+    unsigned char *buffer = read_file(&mem_file);
+    if (buffer == NULL) {
+        fprintf(stderr, "Program terminated.\n");
+        
+        if (mem_file.fp == NULL)
+            fclose(mem_file.fp);
+
+        return EXIT_FAILURE;
+    }
+    printf("Memory successfully loaded.\n");
+    fclose(mem_file.fp);
+
+    if (aes_filepath != NULL) {
+        printf("Parsing offsets for AES.\n");
+        OffsetArray *offset_array = parse_offset(aes_filepath, AES);
+
+        printf("Zeroing based on AES offsets.\n");
+        zero_buffer(buffer, offset_array, mem_file.file_size);
+        printf("Zeroing completed.\n");
+    }
+
+    if (rsa_filepath != NULL) {
+        printf("Parsing offsets for RSA.\n");
+        OffsetArray *offset_array = parse_offset(rsa_filepath, RSA);
+
+        printf("Zeroing based on RSA offsets.\n");
+        zero_buffer(buffer, offset_array, mem_file.file_size);
+        printf("Zeroing completed.\n");
+    }
+
+    if (serpent_filepath != NULL) {
+        printf("Parsing offsets for SERPENT.\n");
+        OffsetArray *offset_array = parse_offset(serpent_filepath, SERPENT);
+
+        printf("Zeroing based on SERPENT offsets.\n");
+        zero_buffer(buffer, offset_array, mem_file.file_size);
+        printf("Zeroing completed.\n");
+    }
+
+    if (twofish_filepath != NULL) {
+        printf("Parsing offsets for TWOFISH.\n");
+        OffsetArray *offset_array = parse_offset(twofish_filepath, TWOFISH);
+
+        printf("Zeroing based on TWOFISH offsets.\n");
+        zero_buffer(buffer, offset_array, mem_file.file_size);
+        printf("Zeroing completed.\n");
+    }
+
+    printf("Loading buffer into file.\n");
+    save_file(output_filepath, buffer, mem_file.file_size);
 }
