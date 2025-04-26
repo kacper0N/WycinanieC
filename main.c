@@ -11,7 +11,6 @@
 #define INITIAL_CAPACITY 2
 #define ALL_SIZE 4
 
-#define RSA_SIZE 512
 #define AES_128_SIZE 176
 #define AES_256_SIZE 240
 #define TWOFISH_256_SIZE 4272
@@ -129,7 +128,7 @@ typedef struct {
     size_t capacity;
 } OffsetArray;
 
-OffsetArray* parse_offset(const char *const file_path, Algorithm algorithm) {
+OffsetArray* parse_offset(const char *const file_path) {
     FileHandler file = open_file(file_path, "r");
     if (file.fp == NULL) {
         fprintf(stderr, "Program terminated.\n");
@@ -206,30 +205,7 @@ OffsetArray* parse_offset(const char *const file_path, Algorithm algorithm) {
         }
 
         offset_array->data[offset_array->size].offset = offset;
-        switch (algorithm) {
-            case AES:
-                if (key_size == 128)
-                    offset_array->data[offset_array->size].key_size = AES_128_SIZE;
-                else if (key_size == 256)
-                    offset_array->data[offset_array->size].key_size = AES_256_SIZE;
-                else {
-                    fprintf(stderr, "Warning: Invalid key size\n");
-                    continue;
-                }
-                break;
-            case RSA:
-                offset_array->data[offset_array->size].key_size = RSA_SIZE;
-                break;
-            case SERPENT:
-                offset_array->data[offset_array->size].key_size = SERPENT_256_SIZE;
-                break;
-            case TWOFISH:
-                offset_array->data[offset_array->size].key_size = TWOFISH_256_SIZE;
-                break;
-            default:
-                // unreachable
-                break;
-        }
+        offset_array->data[offset_array->size].key_size = key_size;
         
         offset_array->size++;
 
@@ -247,15 +223,51 @@ OffsetArray* parse_offset(const char *const file_path, Algorithm algorithm) {
     return offset_array;
 }
 
-bool zero_buffer(unsigned char *buffer, const OffsetArray *const offsets, const size_t buff_size) {
+bool zero_buffer(unsigned char *buffer, const OffsetArray *const offsets, const size_t buff_size, Algorithm algorithm) {
     for (size_t i = 0; i < offsets->size; i++) {
-        OffsetPair offset = offsets->data[i];
+        OffsetPair offset_pair = offsets->data[i];
 
-        if (offset.offset >= buff_size) {
-            printf("Warning: Offset %zu is out of bounds for data size %zu\n", offset.offset, buff_size);
+        size_t offset = offset_pair.offset;
+        size_t key_size = offset_pair.key_size;
+
+        if (offset >= buff_size) {
+            printf("Warning: Offset %zu is out of bounds for data size %zu\n", offset, buff_size);
         }
 
-        memset((void *)(buffer + offset.offset), 0, offset.key_size);
+        switch (algorithm) {
+            case AES:
+                if (key_size == 128)
+                    key_size = AES_128_SIZE;
+                else if (key_size == 256)
+                    key_size = AES_256_SIZE;
+                else {
+                    fprintf(stderr, "Warning: Invalid key size\n");
+                    continue;
+                }
+                break;
+            case RSA:
+                key_size = buffer[offset + 1];  // LEN or LEN TAG
+
+                if ((0x00 < key_size) && (offset <= 0x7f)) // is LEN
+                    key_size += 2; // SEQ TAG (1B) + LEN (1B)
+                else if (key_size == 0x81)  // is LEN TAG (1B)
+                    key_size = buffer[offset + 1] + 3;  // SEQ TAG (1B) + LEN TAG (1B) + LEN (1B)
+                else if (key_size == 0x82) { // is LEN TAG (2B)
+                    key_size = (((unsigned int) buffer[offset + 2] << 8) | (unsigned int) buffer[offset + 3]) + 4;  // SEQ TAG (1B) + LEN TAG (1B) + LEN (2B)
+                }
+                break;
+            case SERPENT:
+                key_size = SERPENT_256_SIZE;
+                break;
+            case TWOFISH:
+                key_size = TWOFISH_256_SIZE;
+                break;
+            default:
+                // unreachable
+                break;
+        }
+        memset((void *) &buffer[offset], 0, key_size);
+
     }
     return true;
 }
@@ -346,37 +358,37 @@ int main(int argc, char *argv[]) {
 
     if (aes_filepath != NULL) {
         printf("Parsing offsets for AES.\n");
-        OffsetArray *offset_array = parse_offset(aes_filepath, AES);
+        OffsetArray *offset_array = parse_offset(aes_filepath);
 
         printf("Zeroing based on AES offsets.\n");
-        zero_buffer(buffer, offset_array, mem_file.file_size);
+        zero_buffer(buffer, offset_array, mem_file.file_size, AES);
         printf("Zeroing completed.\n");
     }
 
     if (rsa_filepath != NULL) {
         printf("Parsing offsets for RSA.\n");
-        OffsetArray *offset_array = parse_offset(rsa_filepath, RSA);
+        OffsetArray *offset_array = parse_offset(rsa_filepath);
 
         printf("Zeroing based on RSA offsets.\n");
-        zero_buffer(buffer, offset_array, mem_file.file_size);
+        zero_buffer(buffer, offset_array, mem_file.file_size, RSA);
         printf("Zeroing completed.\n");
     }
 
     if (serpent_filepath != NULL) {
         printf("Parsing offsets for SERPENT.\n");
-        OffsetArray *offset_array = parse_offset(serpent_filepath, SERPENT);
+        OffsetArray *offset_array = parse_offset(serpent_filepath);
 
         printf("Zeroing based on SERPENT offsets.\n");
-        zero_buffer(buffer, offset_array, mem_file.file_size);
+        zero_buffer(buffer, offset_array, mem_file.file_size, SERPENT);
         printf("Zeroing completed.\n");
     }
 
     if (twofish_filepath != NULL) {
         printf("Parsing offsets for TWOFISH.\n");
-        OffsetArray *offset_array = parse_offset(twofish_filepath, TWOFISH);
+        OffsetArray *offset_array = parse_offset(twofish_filepath);
 
         printf("Zeroing based on TWOFISH offsets.\n");
-        zero_buffer(buffer, offset_array, mem_file.file_size);
+        zero_buffer(buffer, offset_array, mem_file.file_size, TWOFISH);
         printf("Zeroing completed.\n");
     }
 
